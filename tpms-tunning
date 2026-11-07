@@ -1,0 +1,210 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==========================================
+// CONFIGURATION & PINS
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+
+#define I2C_SDA       8
+#define I2C_SCL       9
+#define BUZZER_PIN    6
+
+#define FRONT_MAC     "b9:41:fa:00:46:64"
+#define REAR_MAC      "b9:41:fa:00:48:81"
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// IoT-Ready Telemetry Data Structure
+struct TireData {
+  float pressure;
+  float temp;
+  float voltage;
+  unsigned long lastUpdate;
+  bool active;
+  bool alertState; // Flag controlled by future app/IoT parameters
+};
+
+TireData frontTire = {0.0f, 0.0f, 0.0f, 0, false, false};
+TireData rearTire  = {0.0f, 0.0f, 0.0f, 0, false, false};
+
+// Track changes to refresh screen immediately on new packet
+unsigned long lastRenderFront = 0;
+unsigned long lastRenderRear  = 0;
+
+// ==========================================
+// BLE SCAN CALLBACKS
+// ==========================================
+class TPMSCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* device) override {
+    String mac = String(device->getAddress().toString().c_str());
+    mac.toLowerCase();
+
+    String position = "";
+    if (mac == FRONT_MAC) position = "FRONT";
+    else if (mac == REAR_MAC) position = "REAR";
+    else return;
+
+    if (device->haveManufacturerData()) {
+      std::string data = device->getManufacturerData();
+      if (data.length() < 11) return;
+
+      uint8_t  rawPressByte   = (uint8_t)data[5]; 
+      uint8_t  rawTempByte    = (uint8_t)data[8]; 
+      uint8_t  rawBatteryByte = (uint8_t)data[9] & 0x7F; 
+
+      // Calibrated scaling based on 4.5 PSI benchmark test (128 * 0.0352 = 4.5 PSI)
+      float pressurePsi = (float)rawPressByte * 0.0352f; 
+      float tempC;
+      float voltage = 3.00f;
+
+      if (mac == FRONT_MAC) {
+        tempC = (float)rawTempByte - 67.0f;   
+        frontTire.pressure = pressurePsi;
+        frontTire.temp = tempC;
+        frontTire.voltage = voltage;
+        frontTire.lastUpdate = millis();
+        frontTire.active = true;
+      } else {
+        tempC = (float)rawTempByte - 96.0f;   
+        rearTire.pressure = pressurePsi;
+        rearTire.temp = tempC;
+        rearTire.voltage = voltage;
+        rearTire.lastUpdate = millis();
+        rearTire.active = true;
+      }
+    }
+  }
+};
+
+TPMSCallbacks callbacks;
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW); // Buzzer starts OFF
+
+  // Initialize I2C and OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("OLED allocation failed"));
+    while(1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println(F(" TPMS MONITOR "));
+  display.println(F(" Initializing BLE..."));
+  display.display();
+  delay(1500);
+
+  // Initialize BLE Scanner
+  NimBLEDevice::init("");
+  NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&callbacks, false);
+  pBLEScan->setActiveScan(false);
+  pBLEScan->setInterval(97);
+  pBLEScan->setWindow(97);
+  pBLEScan->start(0, false);
+}
+
+// ==========================================
+// REAL-TIME OLED RENDERER (Retains Last Readings)
+// ==========================================
+void updateDisplay() {
+  // Redraw instantly whenever either tire receives a new BLE data packet
+  if (frontTire.lastUpdate != lastRenderFront || rearTire.lastUpdate != lastRenderRear) {
+    lastRenderFront = frontTire.lastUpdate;
+    lastRenderRear  = rearTire.lastUpdate;
+
+    display.clearDisplay();
+    display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
+
+    // --- FRONT COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(3, 0);
+    display.print(F("FRONT"));
+
+    if (frontTire.active) {
+      display.setCursor(3, 11);
+      display.setTextSize(2);
+      display.print(frontTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(3, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(3, 41);
+      display.print((int)frontTire.temp);
+      display.print(F("C "));
+      display.print(frontTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(3, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    // --- REAR COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(68, 0);
+    display.print(F("REAR"));
+
+    if (rearTire.active) {
+      display.setCursor(68, 11);
+      display.setTextSize(2);
+      display.print(rearTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(68, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(68, 41);
+      display.print((int)rearTire.temp);
+      display.print(F("C "));
+      display.print(rearTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(68, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    display.display();
+  }
+}
+
+// ==========================================
+// BUZZER CONTROL ROUTINE
+// ==========================================
+void updateBuzzer() {
+  bool alertTriggered = frontTire.alertState || rearTire.alertState;
+
+  if (alertTriggered) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  updateDisplay();
+  updateBuzzer();
+  delay(50);
+}

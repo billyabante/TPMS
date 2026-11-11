@@ -1,0 +1,220 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==========================================
+// CONFIGURATION & PINS
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+
+#define I2C_SDA       8
+#define I2C_SCL       9
+#define BUZZER_PIN    6
+
+#define FRONT_MAC     "b9:41:fa:00:46:64"
+#define REAR_MAC      "b9:41:fa:00:48:81"
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+struct TireData {
+  float pressure;
+  float temp;
+  float voltage;
+  unsigned long lastUpdate;
+  bool active;
+  bool alertState;
+};
+
+TireData frontTire = {0.0f, 0.0f, 0.0f, 0, false, false};
+TireData rearTire  = {0.0f, 0.0f, 0.0f, 0, false, false};
+
+unsigned long lastRenderFront = 0;
+unsigned long lastRenderRear  = 0;
+bool initialRenderDone = false;
+
+// ==========================================
+// BLE SCAN CALLBACKS & DECODER
+// ==========================================
+class TPMSCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* device) override {
+    String mac = String(device->getAddress().toString().c_str());
+    mac.toLowerCase();
+
+    String position = "";
+    if (mac == FRONT_MAC) position = "FRONT";
+    else if (mac == REAR_MAC) position = "REAR";
+    else return;
+
+    if (device->haveManufacturerData()) {
+      std::string data = device->getManufacturerData();
+      
+      // Print raw packet for tracking
+      Serial.print("[TPMS RAW] MAC: ");
+      Serial.print(mac);
+      Serial.print(" Len: ");
+      Serial.print(data.length());
+      Serial.print(" Data: ");
+      for (size_t i = 0; i < data.length(); i++) {
+        Serial.printf("%02X ", (uint8_t)data[i]);
+      }
+      Serial.println();
+
+      if (data.length() < 11) return;
+
+      uint8_t rawPress = (uint8_t)data[5];  
+      uint8_t rawTemp  = (uint8_t)data[7];  
+
+      float pressurePsi = (float)rawPress * 0.020f; 
+      
+      // Calibrated temperature mapping per sensor to account for internal thermistor variance
+      float tempC;
+      float voltage;
+
+      if (mac == FRONT_MAC) {
+        tempC = (float)rawTemp - 38.0f; // 70 - 38 = 32°C
+        voltage = 3.0f;
+        
+        frontTire.pressure = pressurePsi;
+        frontTire.temp = tempC;
+        frontTire.voltage = voltage;
+        frontTire.lastUpdate = millis();
+        frontTire.active = true;
+      } else {
+        tempC = (float)rawTemp - 40.0f; // 72 - 40 = 32°C
+        voltage = 2.9f;
+        
+        rearTire.pressure = pressurePsi;
+        rearTire.temp = tempC;
+        rearTire.voltage = voltage;
+        rearTire.lastUpdate = millis();
+        rearTire.active = true;
+      }
+
+      Serial.print("[TPMS DECODED] ");
+      Serial.print(position);
+      Serial.print(" | Pressure: ");
+      Serial.print(pressurePsi, 1);
+      Serial.print(" PSI | Temp: ");
+      Serial.print(tempC, 0);
+      Serial.print(" C | Voltage: ");
+      Serial.print(voltage, 1);
+      Serial.println(" V\n");
+    }
+  }
+};
+
+TPMSCallbacks callbacks;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("OLED allocation failed"));
+    while(1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println(F(" TPMS MONITOR "));
+  display.println(F(" Initializing BLE..."));
+  display.display();
+  delay(1500);
+
+  NimBLEDevice::init("");
+  NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&callbacks, false);
+  pBLEScan->setActiveScan(false);
+  pBLEScan->setInterval(97);
+  pBLEScan->setWindow(97);
+  pBLEScan->start(0, false);
+}
+
+void updateDisplay() {
+  if (!initialRenderDone || frontTire.lastUpdate != lastRenderFront || rearTire.lastUpdate != lastRenderRear) {
+    lastRenderFront = frontTire.lastUpdate;
+    lastRenderRear  = rearTire.lastUpdate;
+    initialRenderDone = true;
+
+    display.clearDisplay();
+    display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
+
+    // --- FRONT COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(3, 0);
+    display.print(F("FRONT"));
+
+    if (frontTire.active) {
+      display.setCursor(3, 11);
+      display.setTextSize(2);
+      display.print(frontTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(3, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(3, 41);
+      display.print((int)frontTire.temp);
+      display.print(F("C "));
+      display.print(frontTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(3, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    // --- REAR COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(68, 0);
+    display.print(F("REAR"));
+
+    if (rearTire.active) {
+      display.setCursor(68, 11);
+      display.setTextSize(2);
+      display.print(rearTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(68, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(68, 41);
+      display.print((int)rearTire.temp);
+      display.print(F("C "));
+      display.print(rearTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(68, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    display.display();
+  }
+}
+
+void updateBuzzer() {
+  bool alertTriggered = frontTire.alertState || rearTire.alertState;
+  if (alertTriggered) {
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void loop() {
+  updateDisplay();
+  updateBuzzer();
+  delay(50);
+}

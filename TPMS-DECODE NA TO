@@ -1,0 +1,212 @@
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ==========================================
+// CONFIGURATION & PINS
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+#define SCREEN_ADDRESS 0x3C
+
+#define I2C_SDA       8
+#define I2C_SCL       9
+#define BUZZER_PIN    6
+
+#define FRONT_MAC     "b9:41:fa:00:46:64"
+#define REAR_MAC      "b9:41:fa:00:48:81"
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+struct TireData {
+  float pressure;
+  float temp;
+  float voltage;
+  unsigned long lastUpdate;
+  bool active;
+  bool hasConnectedOnce;
+};
+
+TireData frontTire = {0.0f, 0.0f, 3.0f, 0, false, false};
+TireData rearTire  = {0.0f, 0.0f, 3.0f, 0, false, false};
+
+unsigned long lastRenderFront = 0;
+unsigned long lastRenderRear  = 0;
+bool initialRenderDone = false;
+
+// ==========================================
+// BLE SCAN CALLBACKS & DECODER
+// ==========================================
+class TPMSCallbacks : public NimBLEScanCallbacks {
+  void onResult(const NimBLEAdvertisedDevice* device) override {
+    String mac = String(device->getAddress().toString().c_str());
+    mac.toLowerCase();
+
+    String position = "";
+    if (mac == FRONT_MAC) position = "FRONT";
+    else if (mac == REAR_MAC) position = "REAR";
+    else return;
+
+    if (device->haveManufacturerData()) {
+      std::string data = device->getManufacturerData();
+      
+      if (data.length() < 11) return;
+
+      // --- EXACT MAP BASED ON YOUR OBSERVATIONS ---
+      uint8_t statusFlag = (uint8_t)data[0]; // 0x04 = Unplugged, 0x05/0x06 = Plugged/Active
+      uint8_t rawTemp    = (uint8_t)data[3]; // Temp byte (-50 offset)
+      uint8_t rawPress   = (uint8_t)data[5]; // Pressure byte
+      uint8_t idByte1    = (uint8_t)data[7]; // MAC last byte part 1
+      uint8_t idByte2    = (uint8_t)data[8]; // MAC last byte part 2
+
+      bool isUnplugged = (statusFlag == 0x04);
+      float pressurePsi = 0.0f;
+
+      if (!isUnplugged) {
+        pressurePsi = (float)rawPress * 0.027f; // Adjust multiplier if needed to match mobile app precisely
+        if (pressurePsi < 0.0f) pressurePsi = 0.0f;
+      }
+
+      float tempC = (float)rawTemp - 50.0f; 
+      float voltage = 3.0f; 
+      unsigned long now = millis();
+
+      if (mac == FRONT_MAC) {
+        frontTire.pressure = pressurePsi;
+        frontTire.temp = tempC;
+        frontTire.voltage = voltage;
+        frontTire.lastUpdate = now;
+        frontTire.active = !isUnplugged;
+        frontTire.hasConnectedOnce = true;
+      } else {
+        rearTire.pressure = pressurePsi;
+        rearTire.temp = tempC;
+        rearTire.voltage = voltage;
+        rearTire.lastUpdate = now;
+        rearTire.active = !isUnplugged;
+        rearTire.hasConnectedOnce = true;
+      }
+
+      Serial.print("[TPMS DECODED] ");
+      Serial.print(position);
+      Serial.print(" | State: 0x");
+      Serial.print(statusFlag, HEX);
+      Serial.print(" | Press: ");
+      Serial.print(pressurePsi, 1);
+      Serial.print(" PSI | Temp: ");
+      Serial.print(tempC, 0);
+      Serial.print(" C | ID: ");
+      Serial.print(idByte1, HEX);
+      Serial.print(" ");
+      Serial.println(idByte2, HEX);
+    }
+  }
+};
+
+TPMSCallbacks callbacks;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("OLED allocation failed"));
+    while(1);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println(F(" TPMS MONITOR "));
+  display.println(F(" Initializing BLE..."));
+  display.display();
+  delay(1500);
+
+  NimBLEDevice::init("");
+  NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+  pBLEScan->setScanCallbacks(&callbacks, false);
+  pBLEScan->setActiveScan(false);
+  pBLEScan->setInterval(45);
+  pBLEScan->setWindow(45);
+  pBLEScan->start(0, false);
+}
+
+void updateDisplay() {
+  if (!initialRenderDone || frontTire.lastUpdate != lastRenderFront || rearTire.lastUpdate != lastRenderRear) {
+    lastRenderFront = frontTire.lastUpdate;
+    lastRenderRear  = rearTire.lastUpdate;
+    initialRenderDone = true;
+
+    display.clearDisplay();
+    display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
+
+    // --- FRONT COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(3, 0);
+    display.print(F("FRONT"));
+
+    if (frontTire.hasConnectedOnce && frontTire.active) {
+      display.setCursor(3, 11);
+      display.setTextSize(2);
+      display.print(frontTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(3, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(3, 41);
+      display.print((int)frontTire.temp);
+      display.print(F("C "));
+      display.print(frontTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(3, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    // --- REAR COLUMN ---
+    display.setTextSize(1);
+    display.setCursor(68, 0);
+    display.print(F("REAR"));
+
+    if (rearTire.hasConnectedOnce && rearTire.active) {
+      display.setCursor(68, 11);
+      display.setTextSize(2);
+      display.print(rearTire.pressure, 1);
+      
+      display.setTextSize(1);
+      display.setCursor(68, 29);
+      display.print(F("PSI"));
+
+      display.setCursor(68, 41);
+      display.print((int)rearTire.temp);
+      display.print(F("C "));
+      display.print(rearTire.voltage, 1);
+      display.print(F("V"));
+    } else {
+      display.setCursor(68, 25);
+      display.setTextSize(1);
+      display.print(F("Waiting"));
+    }
+
+    display.display();
+  }
+}
+
+void loop() {
+  updateDisplay();
+
+  NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+  if (!pBLEScan->isScanning()) {
+    pBLEScan->start(0, false); 
+  }
+}

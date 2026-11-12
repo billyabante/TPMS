@@ -12,9 +12,9 @@
 #define OLED_RESET    -1
 #define SCREEN_ADDRESS 0x3C
 
-#define I2C_SDA       8
-#define I2C_SCL       9
-#define BUZZER_PIN    6
+#define I2C_SDA        8
+#define I2C_SCL        9
+#define BUZZER_PIN     6
 
 #define FRONT_MAC     "b9:41:fa:00:46:64"
 #define REAR_MAC      "b9:41:fa:00:48:81"
@@ -28,14 +28,14 @@ struct TireData {
   unsigned long lastUpdate;
   bool active;
   bool hasConnectedOnce;
+  std::string lastRawData;
 };
 
-TireData frontTire = {0.0f, 0.0f, 3.0f, 0, false, false};
-TireData rearTire  = {0.0f, 0.0f, 3.0f, 0, false, false};
+TireData frontTire = {0.0f, 0.0f, 3.0f, 0, false, false, ""};
+TireData rearTire  = {0.0f, 0.0f, 3.0f, 0, false, false, ""};
 
-unsigned long lastRenderFront = 0;
-unsigned long lastRenderRear  = 0;
-bool initialRenderDone = false;
+bool displayNeedsUpdate = true;
+unsigned long lastPacketCheck = 0;
 
 // ==========================================
 // BLE SCAN CALLBACKS & DECODER
@@ -45,6 +45,7 @@ class TPMSCallbacks : public NimBLEScanCallbacks {
     String mac = String(device->getAddress().toString().c_str());
     mac.toLowerCase();
 
+    // Filter for front and rear sensors only
     String position = "";
     if (mac == FRONT_MAC) position = "FRONT";
     else if (mac == REAR_MAC) position = "REAR";
@@ -52,56 +53,81 @@ class TPMSCallbacks : public NimBLEScanCallbacks {
 
     if (device->haveManufacturerData()) {
       std::string data = device->getManufacturerData();
-      
       if (data.length() < 11) return;
 
-      // --- EXACT MAP BASED ON YOUR OBSERVATIONS ---
-      uint8_t statusFlag = (uint8_t)data[0]; // 0x04 = Unplugged, 0x05/0x06 = Plugged/Active
-      uint8_t rawTemp    = (uint8_t)data[3]; // Temp byte (-50 offset)
-      uint8_t rawPress   = (uint8_t)data[5]; // Pressure byte
-      uint8_t idByte1    = (uint8_t)data[7]; // MAC last byte part 1
-      uint8_t idByte2    = (uint8_t)data[8]; // MAC last byte part 2
+      std::string* lastRaw = (mac == FRONT_MAC) ? &frontTire.lastRawData : &rearTire.lastRawData;
+      TireData* tire = (mac == FRONT_MAC) ? &frontTire : &rearTire;
+      
+      if (data != *lastRaw) {
+        *lastRaw = data;
 
-      bool isUnplugged = (statusFlag == 0x04);
-      float pressurePsi = 0.0f;
-
-      if (!isUnplugged) {
-        pressurePsi = (float)rawPress * 0.027f; // Adjust multiplier if needed to match mobile app precisely
-        if (pressurePsi < 0.0f) pressurePsi = 0.0f;
+        Serial.print("[RAW CHANGED] ");
+        Serial.print(position);
+        Serial.print(" | Hex: ");
+        for (size_t i = 0; i < data.length(); i++) {
+          if ((uint8_t)data[i] < 0x10) Serial.print("0");
+          Serial.print((uint8_t)data[i], HEX);
+          Serial.print(" ");
+        }
+        Serial.println();
       }
 
-      float tempC = (float)rawTemp - 50.0f; 
-      float voltage = 3.0f; 
+      uint8_t statusFlag = (uint8_t)data[0]; // 0x04 = Unplugged, 0x05 = Active/Update, 0x06 = Unchanged/Heartbeat
       unsigned long now = millis();
 
-      if (mac == FRONT_MAC) {
-        frontTire.pressure = pressurePsi;
-        frontTire.temp = tempC;
-        frontTire.voltage = voltage;
-        frontTire.lastUpdate = now;
-        frontTire.active = !isUnplugged;
-        frontTire.hasConnectedOnce = true;
-      } else {
-        rearTire.pressure = pressurePsi;
-        rearTire.temp = tempC;
-        rearTire.voltage = voltage;
-        rearTire.lastUpdate = now;
-        rearTire.active = !isUnplugged;
-        rearTire.hasConnectedOnce = true;
-      }
+      if (statusFlag == 0x04) {
+        // Explicitly Unplugged
+        tire->active = false;
+        tire->pressure = 0.0f;
+        tire->hasConnectedOnce = true;
+        tire->lastUpdate = now;
+        displayNeedsUpdate = true;
 
-      Serial.print("[TPMS DECODED] ");
-      Serial.print(position);
-      Serial.print(" | State: 0x");
-      Serial.print(statusFlag, HEX);
-      Serial.print(" | Press: ");
-      Serial.print(pressurePsi, 1);
-      Serial.print(" PSI | Temp: ");
-      Serial.print(tempC, 0);
-      Serial.print(" C | ID: ");
-      Serial.print(idByte1, HEX);
-      Serial.print(" ");
-      Serial.println(idByte2, HEX);
+        Serial.print("[TPMS DECODED] ");
+        Serial.print(position);
+        Serial.println(" | State: 0x4 | Unplugged (0.0 PSI)");
+      } 
+      else if (statusFlag == 0x05) {
+        // Active data update with new values
+        uint8_t rawTemp  = (uint8_t)data[3]; 
+        uint8_t rawPress = (uint8_t)data[5]; 
+
+        float pressurePsi = (float)rawPress * 0.027f; 
+        if (pressurePsi < 0.0f) pressurePsi = 0.0f;
+
+        float tempC = (float)rawTemp - 50.0f; 
+
+        tire->pressure = pressurePsi;
+        tire->temp = tempC;
+        tire->voltage = 3.0f;
+        tire->lastUpdate = now;
+        tire->active = true;
+        tire->hasConnectedOnce = true;
+        displayNeedsUpdate = true;
+
+        Serial.print("[TPMS DECODED] ");
+        Serial.print(position);
+        Serial.print(" | State: 0x5 | Press: ");
+        Serial.print(pressurePsi, 1);
+        Serial.print(" PSI | Temp: ");
+        Serial.print(tempC, 0);
+        Serial.println(" C");
+      } 
+      else if (statusFlag == 0x06) {
+        // Unchanged / Heartbeat state: preserve the active state and pressure that was already set
+        if (tire->hasConnectedOnce) {
+          tire->lastUpdate = now;
+          displayNeedsUpdate = true;
+
+          Serial.print("[TPMS DECODED] ");
+          Serial.print(position);
+          Serial.print(" | State: 0x6 | Maintaining State Active=");
+          Serial.print(tire->active ? "TRUE" : "FALSE");
+          Serial.print(" | Press: ");
+          Serial.print(tire->pressure, 1);
+          Serial.println(" PSI");
+        }
+      }
     }
   }
 };
@@ -136,77 +162,106 @@ void setup() {
   pBLEScan->setActiveScan(false);
   pBLEScan->setInterval(45);
   pBLEScan->setWindow(45);
+  pBLEScan->setMaxResults(0); 
   pBLEScan->start(0, false);
 }
 
 void updateDisplay() {
-  if (!initialRenderDone || frontTire.lastUpdate != lastRenderFront || rearTire.lastUpdate != lastRenderRear) {
-    lastRenderFront = frontTire.lastUpdate;
-    lastRenderRear  = rearTire.lastUpdate;
-    initialRenderDone = true;
+  display.clearDisplay();
+  display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
 
-    display.clearDisplay();
-    display.drawFastVLine(64, 0, 64, SSD1306_WHITE);
+  // --- FRONT COLUMN ---
+  display.setTextSize(1);
+  display.setCursor(3, 0);
+  display.print(F("FRONT"));
 
-    // --- FRONT COLUMN ---
+  if (frontTire.hasConnectedOnce && frontTire.active) {
+    display.setCursor(3, 11);
+    display.setTextSize(2);
+    display.print(frontTire.pressure, 1);
+    
     display.setTextSize(1);
-    display.setCursor(3, 0);
-    display.print(F("FRONT"));
+    display.setCursor(3, 29);
+    display.print(F("PSI"));
 
-    if (frontTire.hasConnectedOnce && frontTire.active) {
-      display.setCursor(3, 11);
-      display.setTextSize(2);
-      display.print(frontTire.pressure, 1);
-      
-      display.setTextSize(1);
-      display.setCursor(3, 29);
-      display.print(F("PSI"));
-
-      display.setCursor(3, 41);
-      display.print((int)frontTire.temp);
-      display.print(F("C "));
-      display.print(frontTire.voltage, 1);
-      display.print(F("V"));
-    } else {
-      display.setCursor(3, 25);
-      display.setTextSize(1);
-      display.print(F("Waiting"));
-    }
-
-    // --- REAR COLUMN ---
+    display.setCursor(3, 41);
+    display.print((int)frontTire.temp);
+    display.print(F("C "));
+    display.print(frontTire.voltage, 1);
+    display.print(F("V"));
+  } else if (frontTire.hasConnectedOnce && !frontTire.active) {
+    display.setCursor(3, 11);
+    display.setTextSize(2);
+    display.print(F("0.0"));
+    
     display.setTextSize(1);
-    display.setCursor(68, 0);
-    display.print(F("REAR"));
+    display.setCursor(3, 29);
+    display.print(F("PSI"));
 
-    if (rearTire.hasConnectedOnce && rearTire.active) {
-      display.setCursor(68, 11);
-      display.setTextSize(2);
-      display.print(rearTire.pressure, 1);
-      
-      display.setTextSize(1);
-      display.setCursor(68, 29);
-      display.print(F("PSI"));
-
-      display.setCursor(68, 41);
-      display.print((int)rearTire.temp);
-      display.print(F("C "));
-      display.print(rearTire.voltage, 1);
-      display.print(F("V"));
-    } else {
-      display.setCursor(68, 25);
-      display.setTextSize(1);
-      display.print(F("Waiting"));
-    }
-
-    display.display();
+    display.setCursor(3, 41);
+    display.print(F("Unplugged"));
+  } else {
+    display.setCursor(3, 25);
+    display.setTextSize(1);
+    display.print(F("Waiting"));
   }
+
+  // --- REAR COLUMN ---
+  display.setTextSize(1);
+  display.setCursor(68, 0);
+  display.print(F("REAR"));
+
+  if (rearTire.hasConnectedOnce && rearTire.active) {
+    display.setCursor(68, 11);
+    display.setTextSize(2);
+    display.print(rearTire.pressure, 1);
+    
+    display.setTextSize(1);
+    display.setCursor(68, 29);
+    display.print(F("PSI"));
+
+    display.setCursor(68, 41);
+    display.print((int)rearTire.temp);
+    display.print(F("C "));
+    display.print(rearTire.voltage, 1);
+    display.print(F("V"));
+  } else if (rearTire.hasConnectedOnce && !rearTire.active) {
+    display.setCursor(68, 11);
+    display.setTextSize(2);
+    display.print(F("0.0"));
+    
+    display.setTextSize(1);
+    display.setCursor(68, 29);
+    display.print(F("PSI"));
+
+    display.setCursor(68, 41);
+    display.print(F("Unplugged"));
+  } else {
+    display.setCursor(68, 25);
+    display.setTextSize(1);
+    display.print(F("Waiting"));
+  }
+
+  display.display();
 }
 
 void loop() {
-  updateDisplay();
+  if (displayNeedsUpdate) {
+    displayNeedsUpdate = false;
+    updateDisplay();
+  }
 
   NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+  
   if (!pBLEScan->isScanning()) {
-    pBLEScan->start(0, false); 
+    pBLEScan->start(0, false);
+  } else {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastPacketCheck > 5000) {
+      lastPacketCheck = currentMillis;
+      pBLEScan->stop();
+      delay(50);
+      pBLEScan->start(0, false);
+    }
   }
 }
